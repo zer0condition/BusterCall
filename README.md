@@ -209,7 +209,7 @@ All indirect calls target valid Microsoft-signed code with proper ENDBR64 prolog
 - **[jonomango/superfetch](https://github.com/jonomango/superfetch)**
 
 ## License
-This project is released for educational purposes. See individual source files for applicable licenses.
+MIT
 
 ---
 
