@@ -1,4 +1,3 @@
-
 # BusterCall
 ![Demo](image.png)
 **HVCI bypass via PFN swapping to call arbitrary kernel functions from user-mode.**
@@ -52,7 +51,7 @@ This project requires kernel virtual memory read/write capabilities (e.g., an AS
 | **TLB** | This PoC does not perform TLB invalidation. PFN swaps may not take effect immediately on all cores due to cached translations and also might cause BSODs. |
 | **PatchGuard** | Changes are transient (restored after invocation), but be aware of unlucky race conditions. This is research code, not production weaponization. |
 
-**I've addressed and provided some solutions for TLB flushing from usermode in**: [TLB Issue Soltution](https://github.com/zer0condition/BusterCall/issues/3#issuecomment-3865013737)
+**I've addressed and provided some solutions for system-wide TLB flushing from usermode in**: [TLB Issue Soltution](https://github.com/zer0condition/BusterCall/issues/3#issuecomment-3865013737)
 ***
 
 ## Example
