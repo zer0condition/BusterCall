@@ -1,158 +1,62 @@
+
 # BusterCall
-
-
-<b>"Bypassing" HVCI (Hypervisor-protected Code Integrity) via donor PFN swaps to modify read-only code pages.</b>
-
 ![Demo](image.png)
+**HVCI bypass via PFN swapping to call arbitrary kernel functions from user-mode.**
 
----
+
+***
 
 ## Overview
 
-**BusterCall** demonstrates a technique to bypass Windows Hypervisor-protected Code Integrity (HVCI) by leveraging Page Frame Number (PFN) manipulation. The tool enables calling arbitrary kernel functions from user-mode on HVCI-enabled systems by hijacking the System Service Descriptor Table (SSDT) through PFN manipulation.
+BusterCall demonstrates a technique to bypass Windows Hypervisor-protected Code Integrity (HVCI) by swapping the Page Frame Number (PFN) in a target PTE to redirect kernel code paths. The tool enables calling arbitrary exported kernel functions (e.g., `ExAllocatePool`, `DbgPrint`) from user-mode by hijacking the System Service Descriptor Table (SSDT) through physical memory manipulation.
 
----
+***
 
-## Understanding HVCI and Virtual Trust Levels
+## The Technique
 
+HVCI enforces code integrity at the hypervisor level by validating page attributes in the PTE (R/W/X bits). The critical insight: **HVCI validates the attributes in the PTE, not the physical content behind it.** 
 
-### What Does HVCI Protect?
+If the PFN in a PTE is modified to point to a different physical page, HVCI's checks are performed on the attributes of the original PTE (which remain unchanged), while the CPU fetches instructions from the swapped physical page.
 
-HVCI enforces code integrity at the hypervisor level:
+### Attack Flow
 
-| Protection | Description |
-|------------|-------------|
-| **W^X Enforcement** | Pages cannot be both Writable AND Executable simultaneously |
-| **Unsigned Code Prevention** | Blocks execution of unsigned kernel code |
-| **Code Page Protection** | Kernel code pages are marked read-only and non-writable |
-| **Pool Integrity** | NonPagedPoolNx prevents executable pool allocations |
+1. **Identify Target**: Locate a read-only kernel page containing data you want to hijack (e.g., SSDT entries).
+2. **Find Donor**: Locate a writable kernel page (e.g., from a driver `.data` section like `Beep.sys`).
+3. **Copy**: Read the target page content, copy it to the donor page.
+4. **Modify**: Edit the desired data in the donor page copy (e.g., replace an SSDT entry with a pointer to your target function).
+5. **Swap PFN**: Modify the target's PTE to point to the donor's physical address.
+6. **Trigger**: Invoke the syscall; the kernel walks the page tables and executes from your modified donor page.
+7. **Restore**: Swap the original PFN back to clean up.
 
-### The Critical Insight: HVCI Only Validates Page Attributes
+Because the donor page is legitimately writable, no HVCI violations occur when writing to it. The original protected page is never modified.
 
-Here's the key vulnerability: **HVCI security checks are based solely on page security attributes (the PTE), not the actual physical content of the page.**
+***
 
-When the kernel accesses a virtual address, it walks the page tables:
-1. Virtual Address -> PTE lookup
-2. PTE contains the PFN (Page Frame Number) pointing to the physical page
-3. HVCI checks the **attributes in the PTE** (R/W/X bits)
+## Prerequisites
 
-If we modify the PFN in a PTE to point to a *different* physical page, HVCI's checks are performed on the attributes we set, not on the original protected page. This is the foundation of the PFN swapping attack.
+### Driver Primitive
 
----
+This project requires kernel virtual memory read/write capabilities (e.g., an ASUS driver with physical memory write is used in the original implementation to gain virtual read/writes via PreviousMode exploit).
 
-## The PFN Swapping Technique
+### NOTE
 
-### Why Do We Need a "Donor Page"?
+**Leaking kernel addresses on Windows 11 24H2+ requires `SeDebugPrivilege`.** Microsoft restricted `NtQuerySystemInformation` (and related APIs like `EnumDeviceDrivers`) in 24H2 via `ExIsRestrictedCaller`. Without this privilege, the API returns `STATUS_ACCESS_DENIED` for kernel pointer leaks. 
 
-The targets reside in read-only pages. HVCI prevents us from:
-- Modifying the page attributes to add Write permission
-- Allocating new RWX pages
-- Writing directly to read-only kernel memory
+***
 
-**However**, HVCI does not prevent us from:
-- Finding an *existing* legitimate writable page (the "donor")
-- Copying content to that writable page
-- Modifying the PFN to point to the donor's physical address
+## Limitations
 
-The donor page is a legitimate, already-writable kernel page (typically from a driver's `.data` section like Beep.sys). Because it's already marked RW, no HVCI violations occur when we write to it.
+| Limitation | Details |
+|------------|---------|
+| **HLAT** | Not supported. Hypervisor-managed Linear Address Translation (Intel VT-rp) bypasses standard page table walks and uses hypervisor-managed paging structures. This attack targets standard PTE manipulation, which HLAT circumvents. |
+| **TLB** | This PoC does not perform TLB invalidation. PFN swaps may not take effect immediately on all cores due to cached translations and also might cause BSODs. |
+| **PatchGuard** | Changes are transient (restored after invocation), but be aware of unlucky race conditions. This is research code, not production weaponization. |
 
-### The Attack Flow
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         PFN Swap Attack Sequence                        │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  STEP 1: Identify Target Page (Read-Only)                          │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │  Virtual Address: 0xFFFFF802`12340000 (SSDT Page)               │   │
-│  │  PTE.PFN: 0x1A2B3 → Physical: 0x1A2B3000                        │   │
-│  │  Attributes: Present=1, R/W=0 (Read-Only), NX=0                 │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                                     │                                   │
-│                                     ▼                                   │
-│  STEP 2: Find Donor Page (Writable .data Section)                       │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │  Donor VA: 0xFFFFF802`AAAA0000 (Beep.sys .data)                 │   │
-│  │  Donor Physical: 0xDEAD0000                                     │   │
-│  │  Attributes: Present=1, R/W=1 (Writable), NX=1                  │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                                     │                                   │
-│                                     ▼                                   │
-│  STEP 3: Copy SSDT Page Content to Donor Physical Page                  │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │  memcpy(DonorVA, SsdtPageContent, 4096);                        │   │
-│  │  // Now 0xDEAD0000 contains exact copy of SSDT page             │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                                     │                                   │
-│                                     ▼                                   │
-│  STEP 4: Modify the Copied SSDT Entry in Donor                          │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │  // Change syscall entry to point to our target function        │   │
-│  │  CopiedSSDT[NtCreateTransactionIndex] = TargetFunctionRVA;      │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                                     │                                   │
-│                                     ▼                                   │
-│  STEP 5: Swap PFN in Target PTE                                         │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │  BEFORE:                          AFTER:                        │   │
-│  │  PTE.PFN = 0x1A2B3               PTE.PFN = 0xDEAD0              │   │
-│  │       │                               │                         │   │
-│  │       ▼                               ▼                         │   │
-│  │  Original SSDT                    Modified SSDT                 │   │
-│  │  (untouched)                      (in donor page)               │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                                     │                                   │
-│                                     ▼                                   │
-│  STEP 6: Invoke Syscall - Redirected!                                   │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │  NtCreateTransaction() syscall now executes ExAllocatePool()    │   │
-│  │  because the SSDT entry was redirected in our swapped page      │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                                     │                                   │
-│                                     ▼                                   │
-│  STEP 7: Restore Original PFN                                           │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │  PTE.PFN = 0x1A2B3  (restore original mapping)                  │   │
-│  │  No persistent modifications - PatchGuard safe                  │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### Why This Bypasses HVCI
-
-| HVCI Check | Our Action | Result |
-|------------|------------|--------|
-| "Is this page writable?" | We write to an already-writable donor page | **PASS** - Donor is legitimately RW |
-| "Is code being modified?" | Original SSDT page is never touched | **PASS** - We only change the PTE mapping |
-| "Are page attributes being modified?" | We only change the PFN, not the R/W/NX bits | **PASS** - Attributes remain valid |
-| "Is unsigned code being executed?" | We call legitimate signed kernel functions | **PASS** - All code is Microsoft-signed |
-
-**The fundamental weakness:** VTL1's HVCI enforcement runs in a separate context and validates page attributes. It cannot detect that VTL0's page tables have been manipulated to point to different physical pages. The Second Level Address Translation (SLAT/EPT) would need to protect the page tables themselves, but in current implementations, PTEs are not comprehensively monitored for PFN changes.
-
----
-
-## The ASUS Driver Primitive
-
-This project leverages a previously undisclosed vulnerable ASUS driver that provides arbitrary physical memory read/write capabilities. The driver is legitimately signed by ASUS and passes Driver Signature Enforcement (DSE).
-
-### Driver Capabilities
-
-```cpp
-// Read arbitrary physical memory
-ReadPhysicalMemory(PhysicalAddress, Buffer, Size);
-
-// Write arbitrary physical memory  
-WritePhysicalMemory(PhysicalAddress, Buffer, Size);
-```
-
----
+***
 
 ## Example
 
 ```cpp
-// Initialize the BusterCall system
 if (!InitializeBusterCaller()) {
     printf("[-] Failed to initialize\n");
     return;
@@ -165,48 +69,22 @@ CallKernelFunction<NTSTATUS>("DbgPrint", "[BusterCall] Hello from kernel!\n");
 auto Pool = CallKernelFunction<PVOID>("ExAllocatePool", NonPagedPool, 0x1000);
 printf("Allocated kernel pool: 0x%llx\n", Pool);
 
-// Call any exported kernel function
-CallKernelFunction<NTSTATUS>("ZwClose", SomeHandle);
 ```
 
----
+***
 
-## Security Mitigation Analysis
+## Why This Works
 
+HVCI validates PTE attributes at the hypervisor level via Second Level Address Translation (SLAT/EPT). It does not validate that the PFN in a PTE points to the "correct" physical page, it only checks that the attributes (R/W/X) are valid. By swapping the PFN while preserving the original PTE flags, the hypervisor sees a valid, unmodified page table entry, while the CPU executes from attacker-controlled physical memory.
 
-### Mitigations
+**Caveat:** This technique targets the gap between VTL0 (NT kernel) and VTL1 (Hypervisor/Secure Kernel) page table enforcement. It assumes the hypervisor is not monitoring PTEs for PFN changes (which HLAT/HVPT addresses).
 
-| Mitigation | What we do |
-|------------|--------|
-| **HVCI / Core Isolation** | PFN swap doesn't modify protected pages or change page attributes |
-| **PatchGuard (KPP)** | Changes are transient, restored before timer fires |
-| **SMEP** | Never execute user pages from kernel |
-| **SMAP** | Never access user pages from kernel inappropriately |
-| **kCET (Shadow Stack)** | No ROP chains, legitimate control flow |
-| **kCET (IBT)** | All targets are valid kernel function entry points |
+***
 
+## References
 
-### Why kCET Doesn't Help
-
-Kernel Control-flow Enforcement Technology (kCET) provides:
-- **Shadow Stack:** Protects return addresses from corruption
-- **Indirect Branch Tracking:** Validates indirect call/jump targets start with ENDBR64
-
-This attack doesn't subvert control flow - it redirects the SSDT to point to a different **legitimate** kernel function. The syscall dispatch mechanism follows normal execution paths:
-
-```
-Normal:     syscall → KiSystemCall64 → SSDT[idx] → NtCreateTransaction
-Attacked:   syscall → KiSystemCall64 → SSDT[idx] → ExAllocatePool (still a valid function)
-```
-
-All indirect calls target valid Microsoft-signed code with proper ENDBR64 prologues.
-
----
-
-### References
-
-- **[HEXACON2023](https://www.youtube.com/watch?v=WWvd2_jd0ZI)** - Viviane Zwanger and Henning Braun
-- **[jonomango/superfetch](https://github.com/jonomango/superfetch)**
+- **HEXACON 2023** — [Viviane Zwanger and Henning Braun](https://www.youtube.com/watch?v=WWvd2_jd0ZI)
+- **[superfetch](https://github.com/jonomango/superfetch)** — jonomango
 
 ## License
 MIT
